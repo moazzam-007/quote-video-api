@@ -10,9 +10,11 @@ import time
 # ── FFmpeg Settings ───────────────────────────────────────────────────────────
 FFMPEG_TIMEOUT = 600  # 600s (10m) max per ffmpeg call
 THREADS        = "1"   # RAM constraint on Render free tier
-FADE_DURATION  = 0.5   # xfade dissolve duration between images (seconds)
-BLACK_INTRO    = 0.5   # black screen at start (seconds)
-TTS_VOICE      = "en-US-AndrewNeural"
+FADE_DURATION    = 1.0   # xfade dissolve duration between images (seconds)
+BLACK_INTRO      = 1.0   # black screen at start (seconds)
+PRE_VOICE_DELAY  = 1.0   # silence before voice starts (seconds)
+POST_VOICE_DELAY = 0.8   # silence after voice ends before fade (seconds)
+TTS_VOICE        = "en-US-AndrewNeural"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -44,35 +46,21 @@ def get_audio_duration(mp3_path):
         raise RuntimeError(f"ffprobe failed on {mp3_path}: {e}")
 
 
-def download_images(image_urls, work_dir):
-    """Download each image URL to work_dir as img_0.jpg, img_1.jpg, ..."""
-    # Browser-like headers required — Instagram CDN blocks plain Python requests
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://www.instagram.com/",
-        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-    }
-    for i, url in enumerate(image_urls):
-        success = False
-        last_error = None
-        for attempt in range(2):
-            try:
-                resp = requests.get(url, timeout=20, headers=headers)
-                resp.raise_for_status()
-                out_path = os.path.join(work_dir, f"img_{i}.jpg")
-                with open(out_path, "wb") as f:
-                    f.write(resp.content)
-                success = True
-                break
-            except Exception as e:
-                last_error = e
-                time.sleep(1)
-        if not success:
-            raise RuntimeError(f"Failed to download image {i} ({url}): {last_error}")
+import base64
+
+def save_base64_images(images_b64, work_dir):
+    """Save each base64 string to work_dir as img_0.jpg, img_1.jpg, ..."""
+    for i, b64 in enumerate(images_b64):
+        out_path = os.path.join(work_dir, f"img_{i}.jpg")
+        try:
+            # Strip data:image/jpeg;base64, prefix if present
+            if "," in b64:
+                b64 = b64.split(",", 1)[1]
+            img_data = base64.b64decode(b64)
+            with open(out_path, "wb") as f:
+                f.write(img_data)
+        except Exception as e:
+            raise RuntimeError(f"Failed to decode and save base64 image {i}: {e}")
 
 
 
@@ -134,11 +122,14 @@ def create_image_segment(img_path, duration, work_dir, index):
 
 
 def merge_video_audio(video_path, audio_path, work_dir, index):
-    """Mux a silent video segment with its TTS audio track."""
+    """Mux a silent video segment with its TTS audio track, padded with silence."""
     out = os.path.join(work_dir, f"seg_{index}.mp4")
+    delay_ms = int(PRE_VOICE_DELAY * 1000)
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path, "-i", audio_path,
+        "-filter_complex", f"[1:a]adelay={delay_ms}|{delay_ms},apad[a]",
+        "-map", "0:v", "-map", "[a]",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
         "-shortest", "-threads", THREADS,
         out
@@ -200,35 +191,20 @@ def chain_segments_with_xfade(segments, durations, work_dir):
 
 def prepend_black_intro(black_clip, main_video, work_dir):
     """
-    Concatenate black intro + main video using ffmpeg concat demuxer.
-    Black intro has no audio, so we create a silent audio track for it.
+    Xfade black intro into main video.
     """
-    # Add silent audio to black clip so concat works cleanly
     black_with_audio = os.path.join(work_dir, "black_intro_audio.mp4")
     cmd = [
         "ffmpeg", "-y",
         "-i", black_clip,
         "-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
-        "-t", str(BLACK_INTRO), "-shortest", "-threads", THREADS,
+        "-t", str(BLACK_INTRO + FADE_DURATION), "-shortest", "-threads", THREADS,
         black_with_audio
     ]
     run_ffmpeg(cmd)
 
-    # Write concat list
-    concat_list = os.path.join(work_dir, "concat.txt")
-    with open(concat_list, "w") as f:
-        f.write(f"file '{black_with_audio}'\n")
-        f.write(f"file '{main_video}'\n")
-
-    final = os.path.join(work_dir, "final.mp4")
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0", "-i", concat_list,
-        "-c", "copy",
-        final
-    ]
-    run_ffmpeg(cmd)
+    final = xfade_two(black_with_audio, main_video, BLACK_INTRO + FADE_DURATION, work_dir, "final.mp4")
     return final
 
 
@@ -252,23 +228,23 @@ def upload_to_tmpfiles(file_path):
         raise RuntimeError(f"Upload failed: {e}")
 
 
-def process_video_job(job_id, image_urls, quotes):
+def process_video_job(job_id, images_b64, quotes):
     """
     Main orchestration:
-      image_urls: list of str (4-7)
-      quotes:     list of str — one quote per image (same length as image_urls)
+      images_b64: list of str (4-7)
+      quotes:     list of str — one quote per image (same length as images_b64)
     Returns dict with success/video_url/duration_seconds or error.
     """
     work_dir = os.path.join("/tmp", job_id)
     os.makedirs(work_dir, exist_ok=True)
 
     try:
-        n = len(image_urls)
+        n = len(images_b64)
         print(f"[{job_id}] Starting job with {n} images", flush=True)
 
         # Step 1
-        print(f"[{job_id}] Step 1: Downloading images...", flush=True)
-        download_images(image_urls, work_dir)
+        print(f"[{job_id}] Step 1: Saving base64 images...", flush=True)
+        save_base64_images(images_b64, work_dir)
 
         # Step 2
         print(f"[{job_id}] Step 2: Generating TTS...", flush=True)
@@ -281,11 +257,12 @@ def process_video_job(job_id, image_urls, quotes):
         for i in range(n):
             img_path          = os.path.join(work_dir, f"img_{i}.jpg")
             tts_path, tts_dur = tts_results[i]
-            print(f"[{job_id}]   Segment {i+1}/{n} — duration: {tts_dur:.2f}s", flush=True)
-            raw_vid = create_image_segment(img_path, tts_dur, work_dir, i)
+            total_seg_dur = PRE_VOICE_DELAY + tts_dur + POST_VOICE_DELAY + FADE_DURATION
+            print(f"[{job_id}]   Segment {i+1}/{n} — video dur: {total_seg_dur:.2f}s", flush=True)
+            raw_vid = create_image_segment(img_path, total_seg_dur, work_dir, i)
             seg     = merge_video_audio(raw_vid, tts_path, work_dir, i)
             segments.append(seg)
-            durations.append(tts_dur)
+            durations.append(total_seg_dur)
 
         # Step 4
         print(f"[{job_id}] Step 4: Chaining with xfade...", flush=True)
@@ -293,7 +270,7 @@ def process_video_job(job_id, image_urls, quotes):
 
         # Step 5
         print(f"[{job_id}] Step 5: Prepending black intro...", flush=True)
-        black_clip = create_black_clip(work_dir, BLACK_INTRO)
+        black_clip = create_black_clip(work_dir, BLACK_INTRO + FADE_DURATION)
         final_path = prepend_black_intro(black_clip, chained, work_dir)
 
         # Step 6
