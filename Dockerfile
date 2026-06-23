@@ -18,4 +18,4 @@ COPY . .
 EXPOSE 10000
 
 # Run gunicorn with 1 worker to fit within 512MB RAM free tier limit
-CMD ["gunicorn", "--workers", "1", "--bind", "0.0.0.0:10000", "--timeout", "300", "app:app"]
+CMD ["gunicorn", "--workers", "1", "--bind", "0.0.0.0:10000", "--timeout", "900", "app:app"]
