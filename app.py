@@ -146,9 +146,9 @@ def generate():
     if not isinstance(images_b64, list) or not images_b64:
         return jsonify({"success": False, "error": "'images_b64' must be a non-empty list"}), 400
 
-    if len(images_b64) < 4 or len(images_b64) > 7:
+    if len(images_b64) < 1 or len(images_b64) > 10:
         return jsonify({"success": False,
-                        "error": f"'images_b64' must contain 4–7 images (got {len(images_b64)})"}), 400
+                        "error": f"'images_b64' must contain 1–10 images (got {len(images_b64)})"}), 400
 
     # ── Validate quotes ───────────────────────────────────────────────────────
     if not isinstance(quotes, list) or not quotes:
