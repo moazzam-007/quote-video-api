@@ -150,7 +150,7 @@ def concat_and_mix_bgm(segments, work_dir):
         "ffmpeg", "-y", 
         "-i", concat_out, 
         "-stream_loop", "-1", "-i", bgm_file,
-        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:weights=1 0.15[a]",
+        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:weights=1 0.3[a]",
         "-map", "0:v", "-map", "[a]",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
         final_out
