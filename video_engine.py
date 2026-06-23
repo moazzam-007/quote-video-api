@@ -16,7 +16,7 @@ BLACK_INTRO    = 1.0   # 1.0s black intro segment
 PRE_VOICE_DELAY  = 1.0
 POST_VOICE_DELAY = 0.8
 TTS_VOICE      = "en-US-AndrewNeural"
-RESOLUTION     = "720:1280"
+RESOLUTION     = "1080:1920"
 FPS            = 30
 SAMPLE_RATE    = 44100
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ def concat_and_mix_bgm(segments, work_dir):
         "ffmpeg", "-y", 
         "-i", concat_out, 
         "-stream_loop", "-1", "-i", bgm_file,
-        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:weights=1 0.3[a]",
+        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:weights=1 0.2[a]",
         "-map", "0:v", "-map", "[a]",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
         final_out
