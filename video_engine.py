@@ -8,7 +8,7 @@ import json
 import time
 
 # ── FFmpeg Settings ───────────────────────────────────────────────────────────
-FFMPEG_TIMEOUT = 60   # 60s max per ffmpeg call
+FFMPEG_TIMEOUT = 600  # 600s (10m) max per ffmpeg call
 THREADS        = "1"   # RAM constraint on Render free tier
 FADE_DURATION  = 0.5   # xfade dissolve duration between images (seconds)
 BLACK_INTRO    = 0.5   # black screen at start (seconds)
