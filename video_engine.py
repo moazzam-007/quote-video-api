@@ -5,23 +5,25 @@ import asyncio
 import edge_tts
 import shutil
 import json
-import time
+import random
+import base64
 
 # ── FFmpeg Settings ───────────────────────────────────────────────────────────
-FFMPEG_TIMEOUT = 600  # 600s (10m) max per ffmpeg call
-THREADS        = "1"   # RAM constraint on Render free tier
-FADE_DURATION    = 1.0   # xfade dissolve duration between images (seconds)
-BLACK_INTRO      = 1.0   # black screen at start (seconds)
-PRE_VOICE_DELAY  = 1.0   # silence before voice starts (seconds)
-POST_VOICE_DELAY = 0.8   # silence after voice ends before fade (seconds)
-TTS_VOICE        = "en-US-AndrewNeural"
+FFMPEG_TIMEOUT = 600
+THREADS        = "1"
+FADE_DURATION  = 0.5   # 0.5s fade to black at start/end of clips
+BLACK_INTRO    = 1.0   # 1.0s black intro segment
+PRE_VOICE_DELAY  = 1.0
+POST_VOICE_DELAY = 0.8
+TTS_VOICE      = "en-US-AndrewNeural"
+RESOLUTION     = "720:1280"
+FPS            = 30
+SAMPLE_RATE    = 44100
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def run_ffmpeg(cmd):
-    """Run an FFmpeg command. Raises RuntimeError on failure or timeout."""
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd, check=True, timeout=FFMPEG_TIMEOUT,
             capture_output=True, text=True
         )
@@ -30,9 +32,7 @@ def run_ffmpeg(cmd):
     except subprocess.TimeoutExpired:
         raise RuntimeError("FFmpeg timed out")
 
-
 def get_audio_duration(mp3_path):
-    """Use ffprobe to get the duration of an MP3 file in seconds."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -45,15 +45,10 @@ def get_audio_duration(mp3_path):
     except Exception as e:
         raise RuntimeError(f"ffprobe failed on {mp3_path}: {e}")
 
-
-import base64
-
 def save_base64_images(images_b64, work_dir):
-    """Save each base64 string to work_dir as img_0.jpg, img_1.jpg, ..."""
     for i, b64 in enumerate(images_b64):
         out_path = os.path.join(work_dir, f"img_{i}.jpg")
         try:
-            # Strip data:image/jpeg;base64, prefix if present
             if "," in b64:
                 b64 = b64.split(",", 1)[1]
             img_data = base64.b64decode(b64)
@@ -62,18 +57,11 @@ def save_base64_images(images_b64, work_dir):
         except Exception as e:
             raise RuntimeError(f"Failed to decode and save base64 image {i}: {e}")
 
-
-
 async def _tts_async(text, voice, output_path):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_path)
 
-
 def generate_tts_for_each(quotes, work_dir):
-    """
-    Generate a separate TTS mp3 for each quote.
-    Returns list of (tts_path, duration_seconds).
-    """
     results = []
     for i, quote in enumerate(quotes):
         tts_path = os.path.join(work_dir, f"tts_{i}.mp3")
@@ -82,134 +70,99 @@ def generate_tts_for_each(quotes, work_dir):
         results.append((tts_path, duration))
     return results
 
-
-def create_black_clip(work_dir, duration, name="black_intro.mp4"):
-    """Create a silent black video clip of given duration at 1080x1920."""
-    out = os.path.join(work_dir, name)
+def generate_black_intro(work_dir):
+    """Generate 1-second black intro with silence matching the exact segment format."""
+    out = os.path.join(work_dir, "intro.mp4")
     cmd = [
         "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=c=black:s=1080x1920:r=30:d={duration}",
-        "-vf", "setsar=1",
+        "-f", "lavfi", "-i", f"color=c=black:s={RESOLUTION.replace(':', 'x')}:d={BLACK_INTRO}:r={FPS}",
+        "-f", "lavfi", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=stereo",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-pix_fmt", "yuv420p", "-an", "-threads", THREADS,
+        "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p",
+        "-t", str(BLACK_INTRO), "-shortest", "-threads", THREADS,
         out
     ]
     run_ffmpeg(cmd)
     return out
 
-
-def create_image_segment(img_path, duration, work_dir, index):
-    """
-    Convert a still image to a silent video with given duration.
-    Uses decrease+pad so text at edges is never cropped.
-    """
-    out = os.path.join(work_dir, f"raw_{index}.mp4")
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setsar=1"
-    )
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", img_path,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-t", str(duration), "-pix_fmt", "yuv420p",
-        "-vf", vf, "-r", "30", "-an", "-threads", THREADS,
-        out
-    ]
-    run_ffmpeg(cmd)
-    return out
-
-
-def merge_video_audio(video_path, audio_path, work_dir, index):
-    """Mux a silent video segment with its TTS audio track, padded with silence."""
+def create_image_segment(img_path, tts_path, tts_dur, work_dir, index):
+    """Create a 720p segment with fade in/out and perfectly timed TTS audio."""
     out = os.path.join(work_dir, f"seg_{index}.mp4")
+    total_dur = PRE_VOICE_DELAY + tts_dur + POST_VOICE_DELAY
+    fade_out_start = total_dur - FADE_DURATION
+    
+    vf = (
+        f"scale={RESOLUTION}:force_original_aspect_ratio=decrease,"
+        f"pad={RESOLUTION}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"fade=t=in:st=0:d={FADE_DURATION},"
+        f"fade=t=out:st={fade_out_start}:d={FADE_DURATION},"
+        f"format=yuv420p"
+    )
+    
     delay_ms = int(PRE_VOICE_DELAY * 1000)
+    af = (
+        f"adelay={delay_ms}|{delay_ms},apad,atrim=0:{total_dur},"
+        f"aformat=sample_rates={SAMPLE_RATE}:channel_layouts=stereo"
+    )
+    
     cmd = [
         "ffmpeg", "-y",
-        "-i", video_path, "-i", audio_path,
-        "-filter_complex", f"[1:a]adelay={delay_ms}|{delay_ms},apad[a]",
-        "-map", "0:v", "-map", "[a]",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
-        "-shortest", "-threads", THREADS,
-        out
-    ]
-    run_ffmpeg(cmd)
-    return out
-
-
-def xfade_two(clip_a, clip_b, duration_a, work_dir, out_name, fade=FADE_DURATION):
-    """
-    Apply xfade dissolve between two clips.
-    offset = duration_a - fade_duration (where fade starts in clip_a timeline).
-    """
-    out = os.path.join(work_dir, out_name)
-    offset = max(0.0, duration_a - fade)
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", clip_a, "-i", clip_b,
-        "-filter_complex",
-        (
-            f"[0:a]atrim=end={duration_a - fade}[a0];"
-            f"[0:v][1:v]xfade=transition=dissolve:duration={fade}:offset={offset},format=yuv420p[v];"
-            f"[a0][1:a]concat=n=2:v=0:a=1[a]"
-        ),
-        "-map", "[v]", "-map", "[a]",
+        "-loop", "1", "-t", str(total_dur), "-i", img_path,
+        "-i", tts_path,
+        "-vf", vf, "-af", af,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
-        "-pix_fmt", "yuv420p", "-threads", THREADS,
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest", "-r", str(FPS), "-threads", THREADS,
         out
     ]
     run_ffmpeg(cmd)
     return out
 
+def get_random_bgm():
+    """Pick a random BGM file from bgm/ directory if it exists."""
+    bgm_dir = os.path.join(os.getcwd(), "bgm")
+    if os.path.isdir(bgm_dir):
+        files = [f for f in os.listdir(bgm_dir) if f.endswith(('.mp3', '.wav', '.m4a'))]
+        if files:
+            return os.path.join(bgm_dir, random.choice(files))
+    return None
 
-def chain_segments_with_xfade(segments, durations, work_dir):
-    """
-    Sequentially xfade all segments 2-at-a-time.
-    segments: list of mp4 paths (each has video + audio)
-    durations: list of float durations (seconds) for each segment
-    Returns path to the final chained video.
-    """
-    if len(segments) == 1:
-        return segments[0]
-
-    current = segments[0]
-    current_duration = durations[0]
-
-    for i in range(1, len(segments)):
-        out_name = f"chained_{i}.mp4"
-        current = xfade_two(
-            current, segments[i],
-            current_duration, work_dir, out_name
-        )
-        # New duration accounts for the overlap removed by xfade
-        current_duration = current_duration + durations[i] - FADE_DURATION
-
-    return current
-
-
-def prepend_black_intro(black_clip, main_video, work_dir):
-    """
-    Xfade black intro into main video.
-    """
-    black_with_audio = os.path.join(work_dir, "black_intro_audio.mp4")
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", black_clip,
-        "-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
-        "-t", str(BLACK_INTRO + FADE_DURATION), "-shortest", "-threads", THREADS,
-        black_with_audio
+def concat_and_mix_bgm(segments, work_dir):
+    """Concat all segments instantly, then mix BGM if available."""
+    concat_txt = os.path.join(work_dir, "concat.txt")
+    with open(concat_txt, "w") as f:
+        for seg in segments:
+            f.write(f"file '{os.path.abspath(seg).replace(chr(92), '/')}'\n")
+    
+    concat_out = os.path.join(work_dir, "concat_output.mp4")
+    concat_cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+        "-c", "copy", concat_out
     ]
-    run_ffmpeg(cmd)
-
-    final = xfade_two(black_with_audio, main_video, BLACK_INTRO + FADE_DURATION, work_dir, "final.mp4")
-    return final
-
+    run_ffmpeg(concat_cmd)
+    
+    bgm_file = get_random_bgm()
+    if not bgm_file:
+        return concat_out
+    
+    final_out = os.path.join(work_dir, "final.mp4")
+    mix_cmd = [
+        "ffmpeg", "-y", 
+        "-i", concat_out, 
+        "-stream_loop", "-1", "-i", bgm_file,
+        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:weights=1 0.15[a]",
+        "-map", "0:v", "-map", "[a]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        final_out
+    ]
+    try:
+        run_ffmpeg(mix_cmd)
+        return final_out
+    except Exception as e:
+        print(f"Warning: BGM mixing failed, using video without BGM. {e}", flush=True)
+        return concat_out
 
 def upload_to_tmpfiles(file_path):
-    """Upload final.mp4 to tmpfiles.org and return the dl/ URL."""
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(
@@ -220,21 +173,13 @@ def upload_to_tmpfiles(file_path):
             resp.raise_for_status()
         data = resp.json()
         url = data.get("data", {}).get("url", "")
-        # Convert view URL → direct download URL
         if "tmpfiles.org/" in url and "tmpfiles.org/dl/" not in url:
             url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
         return url
     except Exception as e:
         raise RuntimeError(f"Upload failed: {e}")
 
-
 def process_video_job(job_id, images_b64, quotes):
-    """
-    Main orchestration:
-      images_b64: list of str (4-7)
-      quotes:     list of str — one quote per image (same length as images_b64)
-    Returns dict with success/video_url/duration_seconds or error.
-    """
     work_dir = os.path.join("/tmp", job_id)
     os.makedirs(work_dir, exist_ok=True)
 
@@ -242,48 +187,37 @@ def process_video_job(job_id, images_b64, quotes):
         n = len(images_b64)
         print(f"[{job_id}] Starting job with {n} images", flush=True)
 
-        # Step 1
         print(f"[{job_id}] Step 1: Saving base64 images...", flush=True)
         save_base64_images(images_b64, work_dir)
 
-        # Step 2
         print(f"[{job_id}] Step 2: Generating TTS...", flush=True)
         tts_results = generate_tts_for_each(quotes, work_dir)
 
-        # Step 3
-        print(f"[{job_id}] Step 3: Building segments...", flush=True)
-        segments  = []
-        durations = []
+        print(f"[{job_id}] Step 3: Building intro & segments with fade...", flush=True)
+        segments = []
+        intro_seg = generate_black_intro(work_dir)
+        segments.append(intro_seg)
+        
+        total_duration = BLACK_INTRO
         for i in range(n):
-            img_path          = os.path.join(work_dir, f"img_{i}.jpg")
+            img_path = os.path.join(work_dir, f"img_{i}.jpg")
             tts_path, tts_dur = tts_results[i]
-            total_seg_dur = PRE_VOICE_DELAY + tts_dur + POST_VOICE_DELAY + FADE_DURATION
-            print(f"[{job_id}]   Segment {i+1}/{n} — video dur: {total_seg_dur:.2f}s", flush=True)
-            raw_vid = create_image_segment(img_path, total_seg_dur, work_dir, i)
-            seg     = merge_video_audio(raw_vid, tts_path, work_dir, i)
+            seg = create_image_segment(img_path, tts_path, tts_dur, work_dir, i)
             segments.append(seg)
-            durations.append(total_seg_dur)
+            total_duration += (PRE_VOICE_DELAY + tts_dur + POST_VOICE_DELAY)
 
-        # Step 4
-        print(f"[{job_id}] Step 4: Chaining with xfade...", flush=True)
-        chained = chain_segments_with_xfade(segments, durations, work_dir)
+        print(f"[{job_id}] Step 4: Concatenating and Mixing BGM...", flush=True)
+        final_path = concat_and_mix_bgm(segments, work_dir)
 
-        # Step 5
-        print(f"[{job_id}] Step 5: Prepending black intro...", flush=True)
-        black_clip = create_black_clip(work_dir, BLACK_INTRO + FADE_DURATION)
-        final_path = prepend_black_intro(black_clip, chained, work_dir)
-
-        # Step 6
-        print(f"[{job_id}] Step 6: Uploading to tmpfiles...", flush=True)
+        print(f"[{job_id}] Step 5: Uploading to tmpfiles...", flush=True)
         video_url = upload_to_tmpfiles(final_path)
 
-        total_duration = round(BLACK_INTRO + sum(durations) - (n - 1) * FADE_DURATION, 2)
         print(f"[{job_id}] ✅ Done! URL: {video_url}", flush=True)
 
         return {
             "success": True,
             "video_url": video_url,
-            "duration_seconds": total_duration
+            "duration_seconds": round(total_duration, 2)
         }
 
     except Exception as e:
