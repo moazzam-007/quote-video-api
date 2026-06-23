@@ -264,38 +264,44 @@ def process_video_job(job_id, image_urls, quotes):
 
     try:
         n = len(image_urls)
+        print(f"[{job_id}] Starting job with {n} images", flush=True)
 
-        # Step 1 — Download all images
+        # Step 1
+        print(f"[{job_id}] Step 1: Downloading images...", flush=True)
         download_images(image_urls, work_dir)
 
-        # Step 2 — Generate TTS for each quote
+        # Step 2
+        print(f"[{job_id}] Step 2: Generating TTS...", flush=True)
         tts_results = generate_tts_for_each(quotes, work_dir)
-        # tts_results = [(tts_path, duration), ...]
 
-        # Step 3 — Build each segment: image → raw video → merge with TTS
+        # Step 3
+        print(f"[{job_id}] Step 3: Building segments...", flush=True)
         segments  = []
         durations = []
         for i in range(n):
             img_path          = os.path.join(work_dir, f"img_{i}.jpg")
             tts_path, tts_dur = tts_results[i]
-
+            print(f"[{job_id}]   Segment {i+1}/{n} — duration: {tts_dur:.2f}s", flush=True)
             raw_vid = create_image_segment(img_path, tts_dur, work_dir, i)
             seg     = merge_video_audio(raw_vid, tts_path, work_dir, i)
-
             segments.append(seg)
             durations.append(tts_dur)
 
-        # Step 4 — Chain all segments with xfade dissolve between them
+        # Step 4
+        print(f"[{job_id}] Step 4: Chaining with xfade...", flush=True)
         chained = chain_segments_with_xfade(segments, durations, work_dir)
 
-        # Step 5 — Prepend black intro (0.5s)
+        # Step 5
+        print(f"[{job_id}] Step 5: Prepending black intro...", flush=True)
         black_clip = create_black_clip(work_dir, BLACK_INTRO)
         final_path = prepend_black_intro(black_clip, chained, work_dir)
 
-        # Step 6 — Upload to tmpfiles.org
+        # Step 6
+        print(f"[{job_id}] Step 6: Uploading to tmpfiles...", flush=True)
         video_url = upload_to_tmpfiles(final_path)
 
         total_duration = round(BLACK_INTRO + sum(durations) - (n - 1) * FADE_DURATION, 2)
+        print(f"[{job_id}] ✅ Done! URL: {video_url}", flush=True)
 
         return {
             "success": True,
