@@ -7,6 +7,7 @@ import shutil
 import json
 import random
 import base64
+import time
 
 # ── FFmpeg Settings ───────────────────────────────────────────────────────────
 FFMPEG_TIMEOUT = 600
@@ -58,8 +59,15 @@ def save_base64_images(images_b64, work_dir):
             raise RuntimeError(f"Failed to decode and save base64 image {i}: {e}")
 
 async def _tts_async(text, voice, output_path):
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
+    for attempt in range(3):
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(output_path)
+            return
+        except Exception as e:
+            if attempt == 2:
+                raise RuntimeError(f"TTS generation failed after 3 attempts: {e}")
+            await asyncio.sleep(2 ** attempt)
 
 def generate_tts_for_each(quotes, work_dir):
     results = []
@@ -150,7 +158,7 @@ def concat_and_mix_bgm(segments, work_dir):
         "ffmpeg", "-y", 
         "-i", concat_out, 
         "-stream_loop", "-1", "-i", bgm_file,
-        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:weights=1 0.2[a]",
+        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:weights=1 0.2:normalize=0[a]",
         "-map", "0:v", "-map", "[a]",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
         final_out
@@ -163,23 +171,28 @@ def concat_and_mix_bgm(segments, work_dir):
         return concat_out
 
 def upload_to_litterbox(file_path, expiry_time="12h"):
-    try:
-        with open(file_path, "rb") as f:
-            resp = requests.post(
-                "https://litterbox.catbox.moe/resources/internals/api.php",
-                data={"reqtype": "fileupload", "time": expiry_time},
-                files={"fileToUpload": f},
-                timeout=300
-            )
-            resp.raise_for_status()
-        url = resp.text.strip()
-        if not url.startswith("https://"):
-            raise ValueError(f"Invalid url returned: {url}")
-        return url
-    except Exception as e:
-        raise RuntimeError(f"Litterbox upload failed: {e}")
+    for attempt in range(3):
+        try:
+            with open(file_path, "rb") as f:
+                resp = requests.post(
+                    "https://litterbox.catbox.moe/resources/internals/api.php",
+                    data={"reqtype": "fileupload", "time": expiry_time},
+                    files={"fileToUpload": f},
+                    timeout=300
+                )
+                resp.raise_for_status()
+            url = resp.text.strip()
+            if not url.startswith("https://"):
+                raise ValueError(f"Invalid url returned: {url}")
+            return url
+        except Exception as e:
+            if attempt == 2:
+                raise RuntimeError(f"Litterbox upload failed after 3 attempts: {e}")
+            time.sleep(2 ** attempt)
 
 def process_video_job(job_id, images_b64, quotes):
+    if len(images_b64) != len(quotes):
+        return {"success": False, "error": f"Mismatch: {len(images_b64)} images vs {len(quotes)} quotes"}
     work_dir = os.path.join("/tmp", job_id)
     os.makedirs(work_dir, exist_ok=True)
 
