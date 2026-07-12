@@ -162,22 +162,22 @@ def concat_and_mix_bgm(segments, work_dir):
         print(f"Warning: BGM mixing failed, using video without BGM. {e}", flush=True)
         return concat_out
 
-def upload_to_tmpfiles(file_path):
+def upload_to_litterbox(file_path, expiry_time="12h"):
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(
-                "https://tmpfiles.org/api/v1/upload",
-                files={"file": f},
-                timeout=120
+                "https://litterbox.catbox.moe/resources/internals/api.php",
+                data={"reqtype": "fileupload", "time": expiry_time},
+                files={"fileToUpload": f},
+                timeout=300
             )
             resp.raise_for_status()
-        data = resp.json()
-        url = data.get("data", {}).get("url", "")
-        if "tmpfiles.org/" in url and "tmpfiles.org/dl/" not in url:
-            url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+        url = resp.text.strip()
+        if not url.startswith("https://"):
+            raise ValueError(f"Invalid url returned: {url}")
         return url
     except Exception as e:
-        raise RuntimeError(f"Upload failed: {e}")
+        raise RuntimeError(f"Litterbox upload failed: {e}")
 
 def process_video_job(job_id, images_b64, quotes):
     work_dir = os.path.join("/tmp", job_id)
@@ -209,8 +209,8 @@ def process_video_job(job_id, images_b64, quotes):
         print(f"[{job_id}] Step 4: Concatenating and Mixing BGM...", flush=True)
         final_path = concat_and_mix_bgm(segments, work_dir)
 
-        print(f"[{job_id}] Step 5: Uploading to tmpfiles...", flush=True)
-        video_url = upload_to_tmpfiles(final_path)
+        print(f"[{job_id}] Step 5: Uploading to Litterbox (12h temp)...", flush=True)
+        video_url = upload_to_litterbox(final_path)
 
         print(f"[{job_id}] ✅ Done! URL: {video_url}", flush=True)
 
